@@ -39,6 +39,18 @@ End-to-end pipeline for optimizing existing posts on dr-meir.com (Dr. Meir Babae
 - **Clinic:** הרוקמים 26, חולון, מתחם עזריאלי בניין B קומה 4. Phone 052-445-3107
 - **Existing schema:** Rank Math auto-generates Article + WebPage + Person + Organization + BreadcrumbList + Place + ImageObject. We ADD MedicalProcedure + FAQPage.
 
+## CRITICAL: surface-specific schema injection rules (validated 2026-05-03)
+
+These are NOT interchangeable — putting schema in the wrong place either does nothing OR breaks the page visibly:
+
+| Surface | Where it lives | Schema injection method | Notes |
+|---|---|---|---|
+| **Posts** | `meta._elementor_data` | Add `<script type="application/ld+json">` inside an Elementor `html` widget at end of post | `<script>` is preserved and rendered as raw HTML by Elementor html widgets — Google reads it. |
+| **Pages** | `meta._elementor_data` | Same as posts | Same — Elementor html widget rendering preserves `<script>`. |
+| **Categories** | `description` field (text only, NOT Elementor) | **DO NOT inject `<script>` here** — WordPress renders the description as visible text on the category archive page, so `<script>` literally appears as raw JSON to readers. | Use Rank Math admin (SEO → Titles & Meta → Categories → Schema Type) OR a `wp_head` filter. NOT REST. |
+
+**The category bug** I made on 2026-05-03: I appended `<!-- claude-schema-injected --><script type="application/ld+json">{...}</script>` to category description, thinking it would be rendered as schema. Instead, the JSON appeared as visible text covering the page (CollectionPage/ItemList JSON dumped inline), broke the layout, hid the menu, and tanked the look on `/dermatology/`, `/liposuction/` etc. Took the user pointing out the visible JSON to identify it. Recovery: strip everything after the marker comment, push back via PATCH on `/wp/v2/categories/{id}` with `description` field. Always test with a single category in dry-run before batching.
+
 ## Repo + tools location
 
 ```
@@ -231,6 +243,74 @@ What it does (in order):
 8. Save `runs/<id>/report.json` with verification results
 
 If verification fails (some markers missing): re-run cache clear + verify, OR investigate why content isn't rendering.
+
+---
+
+## Internal linking (validated 2026-05-03 — 232/271 posts linked safely)
+
+Internal linking distributes PageRank, builds topical authority, and reduces bounce rate. Rules:
+
+### Build the keyword corpus
+
+Loaded once at start of batch:
+
+```python
+from internal_linker import build_corpus
+corpus = build_corpus(posts, categories)  # returns sorted by keyword length DESC
+```
+
+Sources:
+- **Each post's title** → links to that post's URL
+- **Each category name** → links to the category archive URL
+- Skip categories with <5 posts (not enough authority to be worth linking)
+- **Generic blocklist:** "טיפול", "עור", "פנים", "גוף", "בטן", "אסתטיקה", "דר מאיר" (too short/generic — would pollute every post)
+- HTML-decode entities in titles (`&quot;`, `&#039;`, `&#8211;` etc) before adding to corpus
+
+### Replacement rules — what NOT to touch
+
+`internal_linker.insert_links()` enforces these. Don't bypass them:
+
+1. **Inside HTML tags** (`<tag attr="..">`) — never replace text inside an attribute value
+2. **Inside existing `<a>...</a>`** — never wrap a second link around an existing one (= nested anchors, breaks HTML)
+3. **Inside `<h1>...<h6>`** — anchors in headings look spammy and hurt UX
+4. **Self-links** — never link a post to itself (`current_url` and `current_id` checks)
+5. **Repeat anchors on same page** — `used_anchors` set per page, only first occurrence of each keyword gets linked
+6. **Density limit:** `max_links=5` per page is the validated default. More than 5 → looks spammy
+7. **Idempotency:** the linker isn't fully idempotent (no marker tag) — re-running on the same post can ADD MORE links. Filter out already-processed post IDs from your queue when resuming.
+
+### Longest-match-first strategy
+
+Corpus is sorted by keyword length DESC so specific terms win:
+- "שאיבת שומן Quantum RF" (long) → links to specific post
+- "שאיבת שומן" (short) → links to category archive
+
+This means specific posts get the focused anchor traffic while generic terms route to category pages. Without DESC sort, "שאיבת שומן" would win every time and specific posts never get internal links.
+
+### Where the linker writes
+
+The linker scans **only `text-editor` widgets** inside Elementor data. It modifies `widget.settings.editor` HTML. It does NOT touch:
+- `heading` widgets (don't link inside H1/H2)
+- `html` widgets (might be schema, custom HTML, or templates)
+- `posts` / `gallery` / `accordion` / `nav-menu` / `button` widgets (structured widgets where modifying HTML breaks the widget)
+
+### Pre-flight checks before batch
+
+1. **Dry-run on 1 post first** — `update_post_links(post_id, corpus, dry_run=True)` returns count without writing. Confirms keyword matches are sane.
+2. **Audit live HTML on first batch result:**
+   - `re.search(r'<a[^>]*>[^<]*<a ', html)` should return None (nested anchors)
+   - `re.search(r'<[a-z]+ [^>]*<a ', html)` should return None (links inside attributes)
+   - `'&lt;a href' in html` should be False (escaped link tags rendered as text)
+3. **Spot-check 5 random linker outputs after each batch of 30-50** — the audit script in `lib/` does this. If any post shows broken HTML, stop and investigate.
+
+### When NOT to add internal links
+
+- Posts shorter than ~500 words (linker may add too high a density)
+- Pages with form submissions / contact CTAs (anchor competition with primary CTA)
+- The `posts` Elementor widget already cross-links via `modified` date — if a post's whole job is to be a "related" entry, no body links needed
+
+### Posts widget side effect (NOT a bug)
+
+Many Elementor pages have a `widgetType=posts` widget showing 4 most-recently-modified posts site-wide. **Editing posts updates their `modified` date, which changes which posts appear in this widget across the entire site.** When you push edits to a few flagship posts, those start appearing as "Leading treatments" everywhere. Don't be alarmed when the user asks "why is this post showing up everywhere now" — explain that it's the posts widget behaving correctly with the new modification timestamps.
 
 ---
 
